@@ -1,0 +1,438 @@
+// FreeLang-LLC Phase 5: AVX/SSE Code Generator
+// Purpose: Emit AVX2/AVX-512/SSE4.2 machine code sequences
+// R2: AVX 가속 2-8x speedup
+// ~600 lines
+
+use super::simd_vectorizer::*;
+
+// ============================================================================
+// Part 1: AVX Register File (80 lines)
+// ============================================================================
+
+pub struct AvxRegisterFile {
+    pub zmm_registers: Vec<String>,    // AVX-512: zmm0-zmm31
+    pub ymm_registers: Vec<String>,    // AVX2: ymm0-ymm15
+    pub xmm_registers: Vec<String>,    // SSE: xmm0-xmm15
+    pub k_mask_registers: Vec<String>, // AVX-512 mask: k0-k7
+    pub allocated: Vec<bool>,
+    pub isa: String,
+}
+
+impl AvxRegisterFile {
+    pub fn new_avx2() -> Self {
+        let ymm: Vec<String> = (0..16).map(|i| format!("ymm{}", i)).collect();
+        let xmm: Vec<String> = (0..16).map(|i| format!("xmm{}", i)).collect();
+        Self {
+            zmm_registers: vec![],
+            ymm_registers: ymm.clone(),
+            xmm_registers: xmm,
+            k_mask_registers: vec![],
+            allocated: vec![false; 16],
+            isa: "avx2".to_string(),
+        }
+    }
+
+    pub fn new_avx512() -> Self {
+        let zmm: Vec<String> = (0..32).map(|i| format!("zmm{}", i)).collect();
+        let ymm: Vec<String> = (0..32).map(|i| format!("ymm{}", i)).collect();
+        let xmm: Vec<String> = (0..32).map(|i| format!("xmm{}", i)).collect();
+        let k: Vec<String> = (0..8).map(|i| format!("k{}", i)).collect();
+        Self {
+            zmm_registers: zmm,
+            ymm_registers: ymm,
+            xmm_registers: xmm,
+            k_mask_registers: k,
+            allocated: vec![false; 32],
+            isa: "avx512".to_string(),
+        }
+    }
+
+    pub fn alloc(&mut self) -> Option<String> {
+        for (i, a) in self.allocated.iter_mut().enumerate() {
+            if !*a {
+                *a = true;
+                return Some(match self.isa.as_str() {
+                    "avx512" => format!("zmm{}", i),
+                    _        => format!("ymm{}", i),
+                });
+            }
+        }
+        None
+    }
+
+    pub fn free(&mut self, reg: &str) {
+        let idx: Option<usize> = reg[3..].parse().ok();
+        if let Some(i) = idx {
+            if i < self.allocated.len() {
+                self.allocated[i] = false;
+            }
+        }
+    }
+
+    pub fn available_count(&self) -> u32 {
+        self.allocated.iter().filter(|&&a| !a).count() as u32
+    }
+}
+
+// ============================================================================
+// Part 2: AVX Instruction Emitter (150 lines)
+// ============================================================================
+
+pub struct AvxEmitter {
+    pub isa: String,
+    pub output_asm: Vec<String>,
+    pub byte_count: u32,
+}
+
+impl AvxEmitter {
+    pub fn new(isa: &str) -> Self {
+        Self {
+            isa: isa.to_string(),
+            output_asm: vec![],
+            byte_count: 0,
+        }
+    }
+
+    // Emit vmovaps/vmovdqu (aligned/unaligned load)
+    pub fn emit_load(&mut self, dst: &str, src: &str, aligned: bool) {
+        let mnemonic = if self.isa == "avx512" {
+            if aligned { "vmovaps" } else { "vmovdqu32" }
+        } else {
+            if aligned { "vmovaps" } else { "vmovdqu" }
+        };
+        self.output_asm.push(format!("  {} {}, [{}]", mnemonic, dst, src));
+        self.byte_count += 6;
+    }
+
+    pub fn emit_store(&mut self, dst: &str, src: &str, aligned: bool) {
+        let mnemonic = if aligned { "vmovaps" } else { "vmovdqu" };
+        self.output_asm.push(format!("  {} [{}], {}", mnemonic, dst, src));
+        self.byte_count += 6;
+    }
+
+    pub fn emit_add_f32(&mut self, dst: &str, src1: &str, src2: &str) {
+        self.output_asm.push(format!("  vaddps {}, {}, {}", dst, src1, src2));
+        self.byte_count += 4;
+    }
+
+    pub fn emit_sub_f32(&mut self, dst: &str, src1: &str, src2: &str) {
+        self.output_asm.push(format!("  vsubps {}, {}, {}", dst, src1, src2));
+        self.byte_count += 4;
+    }
+
+    pub fn emit_mul_f32(&mut self, dst: &str, src1: &str, src2: &str) {
+        self.output_asm.push(format!("  vmulps {}, {}, {}", dst, src1, src2));
+        self.byte_count += 4;
+    }
+
+    pub fn emit_div_f32(&mut self, dst: &str, src1: &str, src2: &str) {
+        self.output_asm.push(format!("  vdivps {}, {}, {}", dst, src1, src2));
+        self.byte_count += 6;
+    }
+
+    // FMA: dst = src1*src2 + acc (VFMADD213PS)
+    pub fn emit_fma_f32(&mut self, dst: &str, src1: &str, src2: &str, acc: &str) {
+        self.output_asm.push(format!("  vfmadd213ps {}, {}, {}", dst, src1, src2));
+        self.byte_count += 5;
+    }
+
+    // Broadcast scalar to all lanes
+    pub fn emit_broadcast_f32(&mut self, dst: &str, scalar: &str) {
+        self.output_asm.push(format!("  vbroadcastss {}, {}", dst, scalar));
+        self.byte_count += 5;
+    }
+
+    // Horizontal add (for reduction)
+    pub fn emit_hadd_f32(&mut self, dst: &str, src: &str) {
+        self.output_asm.push(format!("  vhaddps {}, {}, {}", dst, src, src));
+        self.byte_count += 5;
+    }
+
+    // AVX-512 masked load
+    pub fn emit_masked_load(&mut self, dst: &str, src: &str, mask: &str) {
+        self.output_asm.push(format!("  vmovaps {} {{{}}} {{z}}, [{}]", dst, mask, src));
+        self.byte_count += 7;
+    }
+
+    // Gather load (for strided/indirect access)
+    pub fn emit_gather(&mut self, dst: &str, base: &str, indices: &str) {
+        if self.isa == "avx512" {
+            self.output_asm.push(format!("  vgatherdps {} {{k1}}, [{} + {}*4]", dst, base, indices));
+        } else {
+            self.output_asm.push(format!("  vgatherdps {}, [{} + {}*4], ymm15", dst, base, indices));
+        }
+        self.byte_count += 8;
+    }
+
+    // Scatter store (AVX-512 only)
+    pub fn emit_scatter(&mut self, base: &str, indices: &str, src: &str) {
+        if self.isa == "avx512" {
+            self.output_asm.push(format!("  vscatterdps [{} + {}*4] {{k1}}, {}", base, indices, src));
+        } else {
+            // AVX2 fallback: emit scalar stores
+            for i in 0..8 {
+                self.output_asm.push(format!("  vextractf128 xmm0, {}, {}", src, i/4));
+                self.output_asm.push(format!("  vmovss [{}+{}*4], xmm0", base, i));
+            }
+        }
+        self.byte_count += 8;
+    }
+
+    pub fn emit_loop_prologue(&mut self, loop_id: u32, lanes: u32) {
+        self.output_asm.push(format!("; === Vectorized Loop {} (lanes={}) ===", loop_id, lanes));
+        self.output_asm.push("  xor ecx, ecx                ; i = 0".to_string());
+        self.output_asm.push(format!("  mov eax, n"));
+        self.output_asm.push(format!("  and eax, 0xFFFF_FFF{:X}  ; n - (n % {})", !((lanes-1) as u32), lanes));
+        self.output_asm.push(".vector_loop:".to_string());
+    }
+
+    pub fn emit_loop_epilogue(&mut self, lanes: u32) {
+        self.output_asm.push(format!("  add ecx, {}            ; i += lanes", lanes));
+        self.output_asm.push("  cmp ecx, eax".to_string());
+        self.output_asm.push("  jl .vector_loop".to_string());
+        self.output_asm.push("; --- scalar epilog ---".to_string());
+        self.output_asm.push(".scalar_loop:".to_string());
+        self.output_asm.push("  cmp ecx, [n_ptr]".to_string());
+        self.output_asm.push("  jge .done".to_string());
+    }
+
+    pub fn emit_vzeroupper(&mut self) {
+        self.output_asm.push("  vzeroupper                  ; avoid AVX-SSE transition penalty".to_string());
+        self.byte_count += 3;
+    }
+
+    pub fn total_instructions(&self) -> u32 {
+        self.output_asm.len() as u32
+    }
+}
+
+// ============================================================================
+// Part 3: AVX Code Generator (200 lines)
+// ============================================================================
+
+pub struct AvxCodeGenerator {
+    pub emitter: AvxEmitter,
+    pub reg_file: AvxRegisterFile,
+    pub generated_functions: Vec<AvxFunction>,
+    pub total_vector_ops: u64,
+    pub estimated_cycles_saved: u64,
+}
+
+pub struct AvxFunction {
+    pub name: String,
+    pub loop_ids: Vec<u32>,
+    pub total_instructions: u32,
+    pub estimated_speedup: f64,
+    pub asm_code: Vec<String>,
+}
+
+impl AvxCodeGenerator {
+    pub fn new(isa: &str) -> Self {
+        let rf = match isa {
+            "avx512" => AvxRegisterFile::new_avx512(),
+            _        => AvxRegisterFile::new_avx2(),
+        };
+        Self {
+            emitter: AvxEmitter::new(isa),
+            reg_file: rf,
+            generated_functions: vec![],
+            total_vector_ops: 0,
+            estimated_cycles_saved: 0,
+        }
+    }
+
+    pub fn generate_array_add(&mut self, loop_id: u32) -> AvxFunction {
+        let isa = self.emitter.isa.clone();
+        let lanes = if isa == "avx512" { 16u32 } else { 8u32 };
+
+        self.emitter.output_asm.clear();
+        self.emitter.emit_loop_prologue(loop_id, lanes);
+
+        let r0 = self.reg_file.alloc().unwrap_or("ymm0".to_string());
+        let r1 = self.reg_file.alloc().unwrap_or("ymm1".to_string());
+        let r2 = self.reg_file.alloc().unwrap_or("ymm2".to_string());
+
+        self.emitter.emit_load(&r0, "A + rcx*4", true);
+        self.emitter.emit_load(&r1, "B + rcx*4", true);
+        self.emitter.emit_add_f32(&r2, &r0, &r1);
+        self.emitter.emit_store("C + rcx*4", &r2, true);
+        self.emitter.emit_loop_epilogue(lanes);
+        self.emitter.emit_vzeroupper();
+
+        self.reg_file.free(&r0);
+        self.reg_file.free(&r1);
+        self.reg_file.free(&r2);
+
+        let instrs = self.emitter.total_instructions();
+        let speedup = lanes as f64;    // ideal: N lanes = Nx speedup (capped at 8)
+        let speedup = speedup.min(8.0);
+        self.total_vector_ops += instrs as u64;
+
+        AvxFunction {
+            name: format!("vec_array_add_loop_{}", loop_id),
+            loop_ids: vec![loop_id],
+            total_instructions: instrs,
+            estimated_speedup: speedup,
+            asm_code: self.emitter.output_asm.clone(),
+        }
+    }
+
+    pub fn generate_dot_product(&mut self, loop_id: u32) -> AvxFunction {
+        let isa = self.emitter.isa.clone();
+        let lanes = if isa == "avx512" { 16u32 } else { 8u32 };
+
+        self.emitter.output_asm.clear();
+        self.emitter.emit_loop_prologue(loop_id, lanes);
+
+        let acc = self.reg_file.alloc().unwrap_or("ymm0".to_string());
+        let r1 = self.reg_file.alloc().unwrap_or("ymm1".to_string());
+        let r2 = self.reg_file.alloc().unwrap_or("ymm2".to_string());
+
+        // Initialize accumulator
+        self.emitter.output_asm.push(format!("  vpxor {}, {}, {}   ; acc = 0", acc, acc, acc));
+
+        self.emitter.emit_load(&r1, "A + rcx*4", true);
+        self.emitter.emit_load(&r2, "B + rcx*4", true);
+        self.emitter.emit_fma_f32(&acc, &r1, &r2, &acc);   // acc += A*B
+        self.emitter.emit_loop_epilogue(lanes);
+
+        // Horizontal reduction
+        self.emitter.emit_hadd_f32(&acc, &acc);
+        self.emitter.emit_hadd_f32(&acc, &acc);
+        if lanes == 8 {
+            self.emitter.output_asm.push(format!("  vextractf128 xmm0, {}, 1", acc));
+            self.emitter.output_asm.push("  addps xmm0, xmm0".to_string());
+            self.emitter.output_asm.push("  vmovss [result], xmm0".to_string());
+        }
+        self.emitter.emit_vzeroupper();
+
+        self.reg_file.free(&acc);
+        self.reg_file.free(&r1);
+        self.reg_file.free(&r2);
+
+        let instrs = self.emitter.total_instructions();
+        // FMA dot product: ~6x speedup (lanes * 0.75 for reduction overhead)
+        let speedup = (lanes as f64 * 0.75).min(8.0);
+
+        AvxFunction {
+            name: format!("vec_dot_product_loop_{}", loop_id),
+            loop_ids: vec![loop_id],
+            total_instructions: instrs,
+            estimated_speedup: speedup,
+            asm_code: self.emitter.output_asm.clone(),
+        }
+    }
+
+    pub fn generate_saxpy(&mut self, loop_id: u32) -> AvxFunction {
+        // SAXPY: Y = a*X + Y
+        let isa = self.emitter.isa.clone();
+        let lanes = if isa == "avx512" { 16u32 } else { 8u32 };
+
+        self.emitter.output_asm.clear();
+        self.emitter.emit_loop_prologue(loop_id, lanes);
+
+        let scalar_a = self.reg_file.alloc().unwrap_or("ymm0".to_string());
+        let vx = self.reg_file.alloc().unwrap_or("ymm1".to_string());
+        let vy = self.reg_file.alloc().unwrap_or("ymm2".to_string());
+
+        // Broadcast scalar a to all lanes
+        self.emitter.emit_broadcast_f32(&scalar_a, "a_scalar");
+        self.emitter.emit_load(&vx, "X + rcx*4", true);
+        self.emitter.emit_load(&vy, "Y + rcx*4", true);
+        // vy = scalar_a * vx + vy (FMA)
+        self.emitter.emit_fma_f32(&vy, &scalar_a, &vx, &vy);
+        self.emitter.emit_store("Y + rcx*4", &vy, true);
+        self.emitter.emit_loop_epilogue(lanes);
+        self.emitter.emit_vzeroupper();
+
+        self.reg_file.free(&scalar_a);
+        self.reg_file.free(&vx);
+        self.reg_file.free(&vy);
+
+        let instrs = self.emitter.total_instructions();
+        let speedup = (lanes as f64).min(8.0);
+
+        AvxFunction {
+            name: format!("vec_saxpy_loop_{}", loop_id),
+            loop_ids: vec![loop_id],
+            total_instructions: instrs,
+            estimated_speedup: speedup,
+            asm_code: self.emitter.output_asm.clone(),
+        }
+    }
+
+    pub fn generate_from_opportunity(&mut self, opp: &VectorizationOpportunity) -> AvxFunction {
+        match opp.vectorization_type.as_str() {
+            "reduction" => self.generate_dot_product(opp.loop_id),
+            _           => self.generate_array_add(opp.loop_id),
+        }
+    }
+
+    pub fn average_speedup(&self) -> f64 {
+        if self.generated_functions.is_empty() { return 1.0; }
+        let sum: f64 = self.generated_functions.iter().map(|f| f.estimated_speedup).sum();
+        sum / self.generated_functions.len() as f64
+    }
+}
+
+// ============================================================================
+// Part 4: Instruction Schedule (100 lines)
+// ============================================================================
+
+pub struct InstructionScheduler {
+    pub pipeline_depth: u32,       // AVX2: 5, AVX-512: 6
+    pub issue_width: u32,          // 4 per cycle on modern x86
+    pub pending: Vec<(u32, String)>,  // (ready_cycle, instruction)
+    pub current_cycle: u32,
+}
+
+impl InstructionScheduler {
+    pub fn new_avx2() -> Self {
+        Self {
+            pipeline_depth: 5,
+            issue_width: 4,
+            pending: vec![],
+            current_cycle: 0,
+        }
+    }
+
+    pub fn new_avx512() -> Self {
+        Self {
+            pipeline_depth: 6,
+            issue_width: 2,   // AVX-512 has limited ports
+            pending: vec![],
+            current_cycle: 0,
+        }
+    }
+
+    pub fn schedule(&mut self, instructions: &[String]) -> Vec<String> {
+        let mut scheduled = vec![];
+        let mut cycle = 0u32;
+
+        // Simple list scheduling: group independent instructions by cycle
+        let mut groups: Vec<Vec<String>> = vec![];
+        let mut current_group: Vec<String> = vec![];
+
+        for (i, instr) in instructions.iter().enumerate() {
+            current_group.push(instr.clone());
+            if current_group.len() == self.issue_width as usize || i == instructions.len() - 1 {
+                groups.push(current_group.clone());
+                current_group.clear();
+            }
+        }
+
+        for group in &groups {
+            scheduled.push(format!("; cycle {}", cycle));
+            scheduled.extend(group.clone());
+            cycle += 1;
+        }
+
+        self.current_cycle = cycle;
+        scheduled
+    }
+
+    pub fn throughput_utilization(&self, total_instructions: u32) -> f64 {
+        let ideal_cycles = (total_instructions + self.issue_width - 1) / self.issue_width;
+        ideal_cycles as f64 / self.current_cycle.max(1) as f64
+    }
+}

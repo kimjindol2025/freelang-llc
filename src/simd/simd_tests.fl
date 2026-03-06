@@ -1,0 +1,291 @@
+// FreeLang-LLC Phase 5: SIMD Unforgiving Tests
+// 12개 무관용 테스트 (R1: 감지 >90%, R2: 가속 2-8x)
+// ~400 lines
+
+use super::simd_vectorizer::*;
+use super::avx_codegen::*;
+
+pub struct TestResult {
+    pub name: String,
+    pub passed: bool,
+    pub actual: f64,
+    pub expected: String,
+    pub message: String,
+}
+
+impl TestResult {
+    fn pass(name: &str, actual: f64, msg: &str) -> Self {
+        Self { name: name.to_string(), passed: true, actual, expected: "".to_string(), message: msg.to_string() }
+    }
+    fn fail(name: &str, actual: f64, expected: &str, msg: &str) -> Self {
+        Self { name: name.to_string(), passed: false, actual, expected: expected.to_string(), message: msg.to_string() }
+    }
+}
+
+// ============================================================================
+// T1: R1 - Loop Vectorizability Detection Rate > 90%
+// ============================================================================
+pub fn test_t1_detection_rate() -> TestResult {
+    let mut analyzer = VectorizationAnalyzer::new("avx2");
+
+    // Build 10 loops: 9 vectorizable, 1 not (with function call)
+    let loops: Vec<LoopInfo> = (0..10).map(|i| {
+        let mut lp = LoopInfo::new(i);
+        lp.trip_count = Some(1024);
+        lp.access_pattern = "sequential".to_string();
+        lp.body_instruction_count = 3;
+        if i == 5 {
+            lp.has_function_call = true;    // not vectorizable
+        }
+        lp
+    }).collect();
+
+    let opps = analyzer.analyze_function(&loops);
+    let rate = analyzer.detection_rate;
+
+    if rate >= 0.90 {
+        TestResult::pass("T1_detection_rate", rate, &format!("detection_rate={:.1}% >=90% PASS", rate*100.0))
+    } else {
+        TestResult::fail("T1_detection_rate", rate, ">=0.90", &format!("FAIL: {:.1}%", rate*100.0))
+    }
+}
+
+// ============================================================================
+// T2: R1 - Function Call Inhibits Vectorization
+// ============================================================================
+pub fn test_t2_function_call_inhibit() -> TestResult {
+    let mut analyzer = VectorizationAnalyzer::new("avx2");
+    let mut lp = LoopInfo::new(99);
+    lp.has_function_call = true;
+    lp.trip_count = Some(100);
+
+    let opp = analyzer.analyze_loop(&lp);
+    if opp.is_none() {
+        TestResult::pass("T2_func_call_inhibit", 0.0, "function_call loop correctly rejected")
+    } else {
+        TestResult::fail("T2_func_call_inhibit", 1.0, "None", "FAIL: should not vectorize loop with function call")
+    }
+}
+
+// ============================================================================
+// T3: R1 - WAW Dependency Prevents Vectorization
+// ============================================================================
+pub fn test_t3_waw_dependency() -> TestResult {
+    let mut analyzer = VectorizationAnalyzer::new("avx2");
+    let mut lp = LoopInfo::new(0);
+    lp.dependency = LoopDependency::WriteAfterWrite;
+    lp.trip_count = Some(512);
+    lp.access_pattern = "sequential".to_string();
+
+    let opp = analyzer.analyze_loop(&lp);
+    if opp.is_none() {
+        TestResult::pass("T3_waw_dependency", 0.0, "WAW dependency loop correctly rejected")
+    } else {
+        TestResult::fail("T3_waw_dependency", 1.0, "None", "FAIL: WAW loop should not be vectorized")
+    }
+}
+
+// ============================================================================
+// T4: R2 - AVX2 Array-Add Speedup in [2.0, 8.0]
+// ============================================================================
+pub fn test_t4_avx2_array_add_speedup() -> TestResult {
+    let mut codegen = AvxCodeGenerator::new("avx2");
+    let func = codegen.generate_array_add(1);
+    let sp = func.estimated_speedup;
+
+    if sp >= 2.0 && sp <= 8.0 {
+        TestResult::pass("T4_avx2_add_speedup", sp, &format!("speedup={:.2}x in [2,8] PASS", sp))
+    } else {
+        TestResult::fail("T4_avx2_add_speedup", sp, "[2.0,8.0]", &format!("FAIL: {:.2}x out of range", sp))
+    }
+}
+
+// ============================================================================
+// T5: R2 - AVX-512 Dot Product Speedup in [2.0, 8.0]
+// ============================================================================
+pub fn test_t5_avx512_dot_product_speedup() -> TestResult {
+    let mut codegen = AvxCodeGenerator::new("avx512");
+    let func = codegen.generate_dot_product(2);
+    let sp = func.estimated_speedup;
+
+    if sp >= 2.0 && sp <= 8.0 {
+        TestResult::pass("T5_avx512_dot_speedup", sp, &format!("speedup={:.2}x PASS", sp))
+    } else {
+        TestResult::fail("T5_avx512_dot_speedup", sp, "[2.0,8.0]", &format!("FAIL: {:.2}x", sp))
+    }
+}
+
+// ============================================================================
+// T6: SAXPY Vectorization Correctness
+// ============================================================================
+pub fn test_t6_saxpy_codegen() -> TestResult {
+    let mut codegen = AvxCodeGenerator::new("avx2");
+    let func = codegen.generate_saxpy(3);
+
+    let has_broadcast = func.asm_code.iter().any(|l| l.contains("vbroadcastss"));
+    let has_fma = func.asm_code.iter().any(|l| l.contains("vfmadd213ps"));
+    let has_store = func.asm_code.iter().any(|l| l.contains("vmovaps") || l.contains("vmovdqu"));
+
+    if has_broadcast && has_fma && has_store {
+        TestResult::pass("T6_saxpy_codegen", func.estimated_speedup, "SAXPY has broadcast+FMA+store PASS")
+    } else {
+        TestResult::fail("T6_saxpy_codegen", 0.0, "broadcast+FMA+store", "FAIL: missing required instructions")
+    }
+}
+
+// ============================================================================
+// T7: Reduction Loop Horizontal Add
+// ============================================================================
+pub fn test_t7_reduction_hadd() -> TestResult {
+    let mut codegen = AvxCodeGenerator::new("avx2");
+    let func = codegen.generate_dot_product(10);
+    let has_hadd = func.asm_code.iter().any(|l| l.contains("vhaddps"));
+    let has_extract = func.asm_code.iter().any(|l| l.contains("vextractf128"));
+
+    if has_hadd && has_extract {
+        TestResult::pass("T7_reduction_hadd", 1.0, "hadd+extract present for reduction PASS")
+    } else {
+        TestResult::fail("T7_reduction_hadd", 0.0, "vhaddps+vextractf128", "FAIL: reduction instructions missing")
+    }
+}
+
+// ============================================================================
+// T8: VZEROUPPER Emitted After AVX Code
+// ============================================================================
+pub fn test_t8_vzeroupper() -> TestResult {
+    let mut codegen = AvxCodeGenerator::new("avx2");
+    let func = codegen.generate_array_add(5);
+    let has_vzeroupper = func.asm_code.iter().any(|l| l.contains("vzeroupper"));
+
+    if has_vzeroupper {
+        TestResult::pass("T8_vzeroupper", 1.0, "vzeroupper emitted PASS")
+    } else {
+        TestResult::fail("T8_vzeroupper", 0.0, "vzeroupper", "FAIL: missing vzeroupper — AVX-SSE transition penalty risk")
+    }
+}
+
+// ============================================================================
+// T9: Cost Model AVX2 Throughput Sanity
+// ============================================================================
+pub fn test_t9_cost_model_avx2() -> TestResult {
+    let cm = SimdCostModel::avx2();
+    let mut lp = LoopInfo::new(0);
+    lp.access_pattern = "sequential".to_string();
+    lp.dependency = LoopDependency::Independent;
+
+    let sp = cm.estimate_speedup(&lp, "data-parallel");
+    if sp >= 2.0 && sp <= 16.0 {
+        TestResult::pass("T9_cost_model_avx2", sp, &format!("AVX2 cost model speedup={:.1}x PASS", sp))
+    } else {
+        TestResult::fail("T9_cost_model_avx2", sp, "[2,16]", &format!("FAIL: {:.1}x", sp))
+    }
+}
+
+// ============================================================================
+// T10: Instruction Scheduler Throughput
+// ============================================================================
+pub fn test_t10_scheduler_throughput() -> TestResult {
+    let mut sched = InstructionScheduler::new_avx2();
+    let instrs: Vec<String> = (0..20).map(|i| format!("  vaddps ymm{}, ymm{}, ymm{}", i%8, i%8, i%8)).collect();
+    let scheduled = sched.schedule(&instrs);
+    let util = sched.throughput_utilization(20);
+
+    if util >= 0.5 {
+        TestResult::pass("T10_scheduler", util, &format!("utilization={:.1}% PASS", util*100.0))
+    } else {
+        TestResult::fail("T10_scheduler", util, ">=0.5", &format!("FAIL: {:.1}%", util*100.0))
+    }
+}
+
+// ============================================================================
+// T11: Register Allocator Does Not Exhaust Registers
+// ============================================================================
+pub fn test_t11_register_allocation() -> TestResult {
+    let mut rf = AvxRegisterFile::new_avx2();
+    let mut allocated = vec![];
+
+    // Allocate 10 registers (well within 16 available)
+    for _ in 0..10 {
+        if let Some(reg) = rf.alloc() {
+            allocated.push(reg);
+        }
+    }
+
+    let remaining = rf.available_count();
+    if allocated.len() == 10 && remaining == 6 {
+        TestResult::pass("T11_reg_alloc", 10.0, "10 registers allocated, 6 remaining PASS")
+    } else {
+        TestResult::fail("T11_reg_alloc", allocated.len() as f64, "10", &format!("FAIL: allocated={} remaining={}", allocated.len(), remaining))
+    }
+}
+
+// ============================================================================
+// T12: End-to-End Vectorization Report R1+R2
+// ============================================================================
+pub fn test_t12_e2e_report() -> TestResult {
+    let mut vectorizer = SimdVectorizer::new("avx2");
+
+    let loops: Vec<LoopInfo> = (0..12).map(|i| {
+        let mut lp = LoopInfo::new(i);
+        lp.trip_count = Some(1024);
+        lp.body_instruction_count = if i % 3 == 0 { 4 } else { 2 };
+        lp.access_pattern = "sequential".to_string();
+        if i == 11 { lp.has_function_call = true; }    // 1 non-vectorizable
+        lp
+    }).collect();
+
+    vectorizer.vectorize_all(&loops);
+    let report = VectorizationReport::generate(&vectorizer);
+
+    let r1 = report.r1_pass();
+    let r2 = report.r2_pass();
+
+    if r1 && r2 {
+        TestResult::pass("T12_e2e_report", report.avg_speedup,
+            &format!("R1({:.1}%)=PASS R2({:.2}x)=PASS", report.detection_rate*100.0, report.avg_speedup))
+    } else {
+        TestResult::fail("T12_e2e_report", report.avg_speedup, "R1+R2 both PASS",
+            &format!("R1={} R2={} detect={:.1}% speed={:.2}x",
+                if r1 { "PASS" } else { "FAIL" },
+                if r2 { "PASS" } else { "FAIL" },
+                report.detection_rate*100.0, report.avg_speedup))
+    }
+}
+
+// ============================================================================
+// Test Runner
+// ============================================================================
+pub struct SimdTestSuite;
+
+impl SimdTestSuite {
+    pub fn run_all() -> (u32, u32) {
+        let tests: Vec<fn() -> TestResult> = vec![
+            test_t1_detection_rate,
+            test_t2_function_call_inhibit,
+            test_t3_waw_dependency,
+            test_t4_avx2_array_add_speedup,
+            test_t5_avx512_dot_product_speedup,
+            test_t6_saxpy_codegen,
+            test_t7_reduction_hadd,
+            test_t8_vzeroupper,
+            test_t9_cost_model_avx2,
+            test_t10_scheduler_throughput,
+            test_t11_register_allocation,
+            test_t12_e2e_report,
+        ];
+
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+
+        println!("=== FreeLang-LLC Phase 5: SIMD Tests ({} total) ===", tests.len());
+
+        for test_fn in tests {
+            let result = test_fn();
+            let status = if result.passed { "PASS"; passed += 1 } else { "FAIL"; failed += 1 };
+            println!("[{}] {} | actual={:.3} | {}", status, result.name, result.actual, result.message);
+        }
+
+        println!("=== Results: {}/{} passed ===", passed, passed + failed);
+        (passed, failed)
+    }
+}

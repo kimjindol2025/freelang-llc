@@ -1,4 +1,4 @@
-// FreeLang-LLC: Module Integration (Phase 1-4)
+// FreeLang-LLC: Module Integration (Phase 1-5)
 // Purpose: Public API for low-level core library
 
 // Phase 1: Memory & Intrinsics
@@ -18,6 +18,11 @@ pub mod exception_handler;
 // Phase 4: Distributed & Optimizer
 pub mod distributed_bootloader;
 pub mod llvm_optimizer;
+
+// Phase 5: SIMD Vectorization
+pub mod simd::simd_vectorizer;
+pub mod simd::avx_codegen;
+pub mod simd::simd_tests;
 
 pub use pointer::{ManagedPointer, safe_read, safe_write, volatile_read, volatile_write, offset, stride, difference};
 pub use intrinsics::{memory_barrier, atomic_load, atomic_store, atomic_compare_swap, cache_flush, prefetch};

@@ -1,0 +1,566 @@
+// FreeLang-LLC Phase 5: SIMD Vectorizer
+// Purpose: Detect and vectorize loops using SIMD instructions
+// Target: AVX2 (256-bit), AVX-512 (512-bit), SSE4.2 (128-bit)
+// R1: Vectorization detection >90%, R2: 2-8x speedup
+// ~800 lines
+
+// ============================================================================
+// Part 1: SIMD Data Types (100 lines)
+// ============================================================================
+
+pub enum SimdWidth {
+    Sse128,     // 128-bit: 4×f32, 2×f64, 16×i8
+    Avx256,     // 256-bit: 8×f32, 4×f64, 32×i8
+    Avx512,     // 512-bit: 16×f32, 8×f64, 64×i8
+}
+
+pub enum SimdElementType {
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+pub struct SimdVector {
+    pub elements: Vec<f64>,
+    pub width: SimdWidth,
+    pub element_type: SimdElementType,
+    pub lane_count: u32,       // number of parallel lanes
+    pub alignment: u32,        // memory alignment (16, 32, 64 bytes)
+}
+
+impl SimdVector {
+    pub fn new_avx256_f32() -> Self {
+        Self {
+            elements: vec![0.0; 8],
+            width: SimdWidth::Avx256,
+            element_type: SimdElementType::F32,
+            lane_count: 8,
+            alignment: 32,
+        }
+    }
+
+    pub fn new_avx512_f32() -> Self {
+        Self {
+            elements: vec![0.0; 16],
+            width: SimdWidth::Avx512,
+            element_type: SimdElementType::F32,
+            lane_count: 16,
+            alignment: 64,
+        }
+    }
+
+    pub fn new_sse128_f64() -> Self {
+        Self {
+            elements: vec![0.0; 2],
+            width: SimdWidth::Sse128,
+            element_type: SimdElementType::F64,
+            lane_count: 2,
+            alignment: 16,
+        }
+    }
+
+    pub fn load(&mut self, data: &[f64]) -> bool {
+        if data.len() < self.lane_count as usize {
+            return false;
+        }
+        for i in 0..self.lane_count as usize {
+            self.elements[i] = data[i];
+        }
+        true
+    }
+
+    pub fn store(&self, out: &mut Vec<f64>) {
+        for &e in &self.elements {
+            out.push(e);
+        }
+    }
+
+    pub fn lane_bytes(&self) -> u32 {
+        match self.element_type {
+            SimdElementType::I8 => 1,
+            SimdElementType::I16 => 2,
+            SimdElementType::I32 | SimdElementType::F32 => 4,
+            SimdElementType::I64 | SimdElementType::F64 => 8,
+        }
+    }
+}
+
+// ============================================================================
+// Part 2: Loop Analysis (150 lines)
+// ============================================================================
+
+pub enum LoopDependency {
+    Independent,            // No loop-carried dependency — safe to vectorize
+    ReadAfterWrite(u32),    // RAW at distance N
+    WriteAfterRead(u32),    // WAR at distance N
+    WriteAfterWrite,        // WAW — always unsafe
+    Indirect,               // Indirect addressing — unknown at compile time
+}
+
+pub struct LoopInfo {
+    pub id: u32,
+    pub trip_count: Option<u32>,       // None = dynamic
+    pub step: i32,                      // +1, +2, etc.
+    pub access_pattern: String,         // "sequential", "strided", "random"
+    pub dependency: LoopDependency,
+    pub body_instruction_count: u32,
+    pub reduction_variable: Option<String>,  // sum, product, min, max
+    pub has_function_call: bool,
+    pub inner_loops: u32,
+}
+
+impl LoopInfo {
+    pub fn new(id: u32) -> Self {
+        Self {
+            id,
+            trip_count: None,
+            step: 1,
+            access_pattern: "sequential".to_string(),
+            dependency: LoopDependency::Independent,
+            body_instruction_count: 0,
+            reduction_variable: None,
+            has_function_call: false,
+            inner_loops: 0,
+        }
+    }
+
+    pub fn is_vectorizable(&self) -> bool {
+        // Check all preconditions
+        match self.dependency {
+            LoopDependency::Independent => {}
+            LoopDependency::ReadAfterWrite(d) if d >= 8 => {}  // Safe if distance >= vector width
+            _ => return false,
+        }
+        if self.has_function_call { return false; }
+        if self.access_pattern == "random" { return false; }
+        if self.step <= 0 { return false; }
+        true
+    }
+
+    pub fn vectorization_gain(&self, simd_width: u32, element_bytes: u32) -> f64 {
+        let lanes = simd_width / (element_bytes * 8);
+        let base = lanes as f64;
+        // Reduction variable slightly penalizes gain (need horizontal ops)
+        if self.reduction_variable.is_some() {
+            base * 0.75
+        } else {
+            base
+        }
+    }
+}
+
+pub struct LoopNest {
+    pub loops: Vec<LoopInfo>,
+    pub depth: u32,
+}
+
+impl LoopNest {
+    pub fn new() -> Self {
+        Self { loops: vec![], depth: 0 }
+    }
+
+    pub fn add_loop(&mut self, lp: LoopInfo) {
+        if lp.inner_loops == 0 { self.depth += 1; }
+        self.loops.push(lp);
+    }
+
+    pub fn innermost_vectorizable(&self) -> Vec<&LoopInfo> {
+        self.loops.iter()
+            .filter(|l| l.inner_loops == 0 && l.is_vectorizable())
+            .collect()
+    }
+}
+
+// ============================================================================
+// Part 3: Vectorization Analysis Engine (200 lines)
+// ============================================================================
+
+pub struct VectorizationOpportunity {
+    pub loop_id: u32,
+    pub recommended_width: SimdWidth,
+    pub expected_speedup: f64,
+    pub vectorization_type: String,     // "data-parallel", "reduction", "gather-scatter"
+    pub tail_handling: String,          // "scalar-epilog", "predicated", "peeled"
+}
+
+pub struct VectorizationAnalyzer {
+    pub target_isa: String,      // "avx2", "avx512", "sse42", "neon"
+    pub total_loops_analyzed: u32,
+    pub vectorizable_count: u32,
+    pub opportunities: Vec<VectorizationOpportunity>,
+    pub detection_rate: f64,
+}
+
+impl VectorizationAnalyzer {
+    pub fn new(isa: &str) -> Self {
+        Self {
+            target_isa: isa.to_string(),
+            total_loops_analyzed: 0,
+            vectorizable_count: 0,
+            opportunities: vec![],
+            detection_rate: 0.0,
+        }
+    }
+
+    pub fn analyze_loop(&mut self, lp: &LoopInfo) -> Option<VectorizationOpportunity> {
+        self.total_loops_analyzed += 1;
+
+        if !lp.is_vectorizable() {
+            return None;
+        }
+
+        let (width, element_bytes) = self.choose_simd_width(lp);
+        let speedup = lp.vectorization_gain(
+            match width {
+                SimdWidth::Sse128 => 128,
+                SimdWidth::Avx256 => 256,
+                SimdWidth::Avx512 => 512,
+            },
+            element_bytes
+        );
+
+        // Only vectorize if speedup >= 2x (R2)
+        if speedup < 2.0 { return None; }
+
+        self.vectorizable_count += 1;
+
+        let vtype = if lp.reduction_variable.is_some() {
+            "reduction"
+        } else if lp.access_pattern == "strided" {
+            "gather-scatter"
+        } else {
+            "data-parallel"
+        };
+
+        let tail = if let Some(tc) = lp.trip_count {
+            let lanes = match width { SimdWidth::Sse128 => 4, SimdWidth::Avx256 => 8, SimdWidth::Avx512 => 16 };
+            if tc % lanes == 0 { "none" } else { "scalar-epilog" }
+        } else {
+            "predicated"
+        };
+
+        let opp = VectorizationOpportunity {
+            loop_id: lp.id,
+            recommended_width: width,
+            expected_speedup: speedup,
+            vectorization_type: vtype.to_string(),
+            tail_handling: tail.to_string(),
+        };
+
+        self.opportunities.push(opp);
+        self.update_detection_rate();
+        self.opportunities.last().map(|_| VectorizationOpportunity {
+            loop_id: lp.id,
+            recommended_width: self.choose_simd_width(lp).0,
+            expected_speedup: speedup,
+            vectorization_type: vtype.to_string(),
+            tail_handling: tail.to_string(),
+        })
+    }
+
+    fn choose_simd_width(&self, lp: &LoopInfo) -> (SimdWidth, u32) {
+        match self.target_isa.as_str() {
+            "avx512" => (SimdWidth::Avx512, 4),
+            "avx2"   => (SimdWidth::Avx256, 4),
+            "neon"   => (SimdWidth::Sse128, 4),
+            _        => (SimdWidth::Sse128, 4),  // sse42 fallback
+        }
+    }
+
+    fn update_detection_rate(&mut self) {
+        if self.total_loops_analyzed == 0 { return; }
+        self.detection_rate = self.vectorizable_count as f64 / self.total_loops_analyzed as f64;
+    }
+
+    pub fn meets_r1_threshold(&self) -> bool {
+        // R1: detection rate > 90% among structurally vectorizable loops
+        self.detection_rate >= 0.90
+    }
+
+    pub fn analyze_function(&mut self, loops: &[LoopInfo]) -> Vec<VectorizationOpportunity> {
+        let mut results = vec![];
+        for lp in loops {
+            if let Some(opp) = self.analyze_loop(lp) {
+                results.push(opp);
+            }
+        }
+        results
+    }
+}
+
+// ============================================================================
+// Part 4: Cost Model (100 lines)
+// ============================================================================
+
+pub struct SimdCostModel {
+    pub isa: String,
+    pub vector_throughput: f64,    // ops/cycle
+    pub scalar_throughput: f64,
+    pub gather_cost: u32,          // cycles for gather instruction
+    pub scatter_cost: u32,
+    pub horizontal_op_cost: u32,   // for reduction operations
+    pub memory_bandwidth_gbps: f64,
+}
+
+impl SimdCostModel {
+    pub fn avx2() -> Self {
+        Self {
+            isa: "avx2".to_string(),
+            vector_throughput: 8.0,    // 8 f32 ops/cycle
+            scalar_throughput: 1.0,
+            gather_cost: 4,
+            scatter_cost: 6,
+            horizontal_op_cost: 3,
+            memory_bandwidth_gbps: 40.0,
+        }
+    }
+
+    pub fn avx512() -> Self {
+        Self {
+            isa: "avx512".to_string(),
+            vector_throughput: 16.0,
+            scalar_throughput: 1.0,
+            gather_cost: 8,
+            scatter_cost: 12,
+            horizontal_op_cost: 4,
+            memory_bandwidth_gbps: 80.0,
+        }
+    }
+
+    pub fn estimate_speedup(&self, lp: &LoopInfo, vtype: &str) -> f64 {
+        match vtype {
+            "data-parallel" => self.vector_throughput / self.scalar_throughput,
+            "reduction"     => (self.vector_throughput / self.scalar_throughput) * 0.75,
+            "gather-scatter" => {
+                let effective = self.vector_throughput / (self.gather_cost as f64 / 2.0);
+                effective.max(2.0)
+            }
+            _ => 2.0,
+        }
+    }
+
+    pub fn is_memory_bound(&self, bytes_per_iteration: u64, cycles_per_iteration: u64) -> bool {
+        let bytes_per_sec = bytes_per_iteration as f64 * 3_000_000_000.0 / cycles_per_iteration as f64;
+        let bw = self.memory_bandwidth_gbps * 1e9;
+        bytes_per_sec > bw * 0.8   // memory-bound if >80% bandwidth
+    }
+}
+
+// ============================================================================
+// Part 5: Vectorizer Transform Engine (150 lines)
+// ============================================================================
+
+pub enum SimdInstruction {
+    VLoad { dst: String, src: String, width: u32 },        // vmovaps/vmovdqu
+    VStore { dst: String, src: String, width: u32 },       // vmovaps
+    VAdd { dst: String, src1: String, src2: String },      // vaddps
+    VSub { dst: String, src1: String, src2: String },      // vsubps
+    VMul { dst: String, src1: String, src2: String },      // vmulps
+    VDiv { dst: String, src1: String, src2: String },      // vdivps
+    VFma { dst: String, src1: String, src2: String, acc: String }, // vfmadd213ps
+    VBroadcast { dst: String, scalar: String, width: u32 },// vbroadcastss
+    VHAdd { dst: String, src: String },                     // vhaddps (horizontal add)
+    VGather { dst: String, base: String, indices: String },// vgatherdps
+    VScatter { base: String, indices: String, src: String },// vscatterdps
+    VCmp { dst: String, src1: String, src2: String, op: String }, // vcmpps
+    VBlend { dst: String, src1: String, src2: String, mask: String }, // vblendvps
+    VPermute { dst: String, src: String, ctrl: u32 },      // vpermps
+}
+
+pub struct VectorizedLoop {
+    pub original_loop_id: u32,
+    pub simd_instructions: Vec<SimdInstruction>,
+    pub scalar_epilog: Vec<String>,
+    pub total_vector_ops: u32,
+    pub lanes: u32,
+    pub estimated_speedup: f64,
+}
+
+pub struct SimdVectorizer {
+    pub analyzer: VectorizationAnalyzer,
+    pub cost_model: SimdCostModel,
+    pub vectorized_loops: Vec<VectorizedLoop>,
+    pub total_speedup_sum: f64,
+    pub vectorized_count: u32,
+}
+
+impl SimdVectorizer {
+    pub fn new(isa: &str) -> Self {
+        let cost = match isa {
+            "avx512" => SimdCostModel::avx512(),
+            _ => SimdCostModel::avx2(),
+        };
+        Self {
+            analyzer: VectorizationAnalyzer::new(isa),
+            cost_model: cost,
+            vectorized_loops: vec![],
+            total_speedup_sum: 0.0,
+            vectorized_count: 0,
+        }
+    }
+
+    pub fn vectorize_loop(&mut self, lp: &LoopInfo) -> Option<VectorizedLoop> {
+        let opp = self.analyzer.analyze_loop(lp)?;
+
+        let lanes = match opp.recommended_width {
+            SimdWidth::Sse128 => 4u32,
+            SimdWidth::Avx256 => 8,
+            SimdWidth::Avx512 => 16,
+        };
+        let width_bits = lanes * 32;
+
+        let mut instrs = vec![];
+
+        // Load A[i..i+lanes]
+        instrs.push(SimdInstruction::VLoad {
+            dst: format!("ymm0"),
+            src: format!("A+i*4"),
+            width: width_bits,
+        });
+        // Load B[i..i+lanes]
+        instrs.push(SimdInstruction::VLoad {
+            dst: "ymm1".to_string(),
+            src: "B+i*4".to_string(),
+            width: width_bits,
+        });
+        // FMA or Add depending on loop body
+        if lp.body_instruction_count >= 3 {
+            instrs.push(SimdInstruction::VFma {
+                dst: "ymm2".to_string(),
+                src1: "ymm0".to_string(),
+                src2: "ymm1".to_string(),
+                acc: "ymm2".to_string(),
+            });
+        } else {
+            instrs.push(SimdInstruction::VAdd {
+                dst: "ymm2".to_string(),
+                src1: "ymm0".to_string(),
+                src2: "ymm1".to_string(),
+            });
+        }
+        // Store C[i..i+lanes]
+        instrs.push(SimdInstruction::VStore {
+            dst: "C+i*4".to_string(),
+            src: "ymm2".to_string(),
+            width: width_bits,
+        });
+
+        // Reduction horizontal add
+        let mut epilog = vec![];
+        if lp.reduction_variable.is_some() {
+            instrs.push(SimdInstruction::VHAdd {
+                dst: "ymm2".to_string(),
+                src: "ymm2".to_string(),
+            });
+            epilog.push("extract_lane ymm2, xmm0, 0".to_string());
+            epilog.push("scalar_add result, xmm0".to_string());
+        }
+
+        let speedup = self.cost_model.estimate_speedup(lp, &opp.vectorization_type);
+        self.total_speedup_sum += speedup;
+        self.vectorized_count += 1;
+
+        let vl = VectorizedLoop {
+            original_loop_id: lp.id,
+            simd_instructions: instrs,
+            scalar_epilog: epilog,
+            total_vector_ops: 4,
+            lanes,
+            estimated_speedup: speedup,
+        };
+
+        self.vectorized_loops.push(VectorizedLoop {
+            original_loop_id: lp.id,
+            simd_instructions: vec![],
+            scalar_epilog: vec![],
+            total_vector_ops: 4,
+            lanes,
+            estimated_speedup: speedup,
+        });
+
+        Some(vl)
+    }
+
+    pub fn average_speedup(&self) -> f64 {
+        if self.vectorized_count == 0 { return 1.0; }
+        self.total_speedup_sum / self.vectorized_count as f64
+    }
+
+    pub fn meets_r2_speedup(&self) -> bool {
+        // R2: average speedup 2-8x
+        let avg = self.average_speedup();
+        avg >= 2.0 && avg <= 8.0
+    }
+
+    pub fn vectorize_all(&mut self, loops: &[LoopInfo]) -> u32 {
+        let mut count = 0u32;
+        for lp in loops {
+            if self.vectorize_loop(lp).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
+// ============================================================================
+// Part 6: Profiling & Metrics (100 lines)
+// ============================================================================
+
+pub struct VectorizationReport {
+    pub total_loops: u32,
+    pub vectorized_loops: u32,
+    pub detection_rate: f64,       // R1: must be >90%
+    pub avg_speedup: f64,          // R2: must be 2-8x
+    pub max_speedup: f64,
+    pub min_speedup: f64,
+    pub total_vector_instructions: u32,
+    pub isa_used: String,
+    pub memory_bound_loops: u32,
+    pub reduction_loops: u32,
+}
+
+impl VectorizationReport {
+    pub fn generate(vectorizer: &SimdVectorizer) -> Self {
+        let mut max_sp = 0.0f64;
+        let mut min_sp = f64::MAX;
+        let mut total_instrs = 0u32;
+        let mut reductions = 0u32;
+
+        for vl in &vectorizer.vectorized_loops {
+            max_sp = max_sp.max(vl.estimated_speedup);
+            min_sp = min_sp.min(vl.estimated_speedup);
+            total_instrs += vl.total_vector_ops;
+        }
+
+        Self {
+            total_loops: vectorizer.analyzer.total_loops_analyzed,
+            vectorized_loops: vectorizer.vectorized_count,
+            detection_rate: vectorizer.analyzer.detection_rate,
+            avg_speedup: vectorizer.average_speedup(),
+            max_speedup: max_sp,
+            min_speedup: if min_sp == f64::MAX { 0.0 } else { min_sp },
+            total_vector_instructions: total_instrs,
+            isa_used: vectorizer.cost_model.isa.clone(),
+            memory_bound_loops: 0,
+            reduction_loops: reductions,
+        }
+    }
+
+    pub fn r1_pass(&self) -> bool { self.detection_rate >= 0.90 }
+    pub fn r2_pass(&self) -> bool { self.avg_speedup >= 2.0 && self.avg_speedup <= 8.0 }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "VectorizationReport: loops={}/{} detect={:.1}% speedup={:.2}x [{:.2}x-{:.2}x] R1={} R2={}",
+            self.vectorized_loops, self.total_loops,
+            self.detection_rate * 100.0,
+            self.avg_speedup, self.min_speedup, self.max_speedup,
+            if self.r1_pass() { "PASS" } else { "FAIL" },
+            if self.r2_pass() { "PASS" } else { "FAIL" },
+        )
+    }
+}
